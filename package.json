@@ -1,0 +1,7 @@
+{
+  "name": "tft-analyzer-api",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node api/analyze_board.js" },
+  "dependencies": { "express": "^4.19.2", "cors": "^2.8.5" }
+}
