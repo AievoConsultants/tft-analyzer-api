@@ -1,59 +1,106 @@
 // src/updateCompStats.ts
-import { fetchDiamondPlusSeeds, resolvePuuid, fetchMatchIdsByPuuid, sleep } from "./riot";
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  listDiamondSeeds,
+  puuidFromSummonerId,
+  puuidFromName,
+  matchIdsByPuuid,
+  fetchMatch,
+  Platform,
+  Region,
+} from "./riot";
 
-const PLATFORM     = process.env.PLATFORM   || "na1";
-const REGION       = process.env.REGION     || "americas";
-const MIN_SAMPLE   = Number(process.env.MIN_SAMPLE ?? 120);
-const SEED_PLAYERS = Number(process.env.SEED_PLAYERS ?? 40);
-const COUNT_PER    = Number(process.env.COUNT_PER ?? 5);
-const QUEUES       = process.env.QUEUES ? Number(process.env.QUEUES) : 1100;
-const RIOT_API_KEY = process.env.RIOT_API_KEY || "";
+const PLATFORM = (process.env.PLATFORM || "na1") as Platform;
+const REGION = (process.env.REGION || "americas") as Region;
 
-const OUT_FILE = path.join("public", "data", "comps.json");
+// knobs for rate/volume – safe defaults
+const MIN_SAMPLE = Number(process.env.MIN_SAMPLE || 5);   // stop after >= this many matches
+const SEED_PLAYERS = Number(process.env.SEED_PLAYERS || 20);
+const COUNT_PER = Number(process.env.COUNT_PER || 3);     // matches per PUUID
+const OUTPUT = path.join(process.cwd(), "public", "data", "comps.json");
 
-async function main() {
-  if (!RIOT_API_KEY) throw new Error("RIOT_API_KEY is missing");
-  console.log("config:", JSON.stringify({ PLATFORM, REGION, MIN_SAMPLE, SEED_PLAYERS, COUNT_PER, QUEUES }));
-
-  // 1) Seeds (Diamond+)
-  const seeds = await fetchDiamondPlusSeeds(PLATFORM, RIOT_API_KEY, SEED_PLAYERS);
-  console.log(`Diamond+ seeds fetched: ${seeds.length}`);
-
-  // 2) Resolve to PUUIDs (by-id then by-name)
-  const puuids: string[] = [];
-  for (const s of seeds) {
-    const puuid = await resolvePuuid(PLATFORM, s, RIOT_API_KEY);
-    if (puuid) puuids.push(puuid);
-    await sleep(80);
-  }
-  console.log(`PUUIDs collected: ${puuids.length}`);
-
-  // 3) Pull matches until MIN_SAMPLE
-  const seen = new Set<string>();
-  for (const puuid of puuids) {
-    const ids = await fetchMatchIdsByPuuid(REGION, puuid, COUNT_PER, QUEUES, RIOT_API_KEY);
-    for (const id of ids) seen.add(id);
-    console.log(`puuid ${puuid.slice(0,8)}*: +${ids.length} (total ${seen.size})`);
-    if (seen.size >= MIN_SAMPLE) break;
-    await sleep(80);
-  }
-
-  // 4) Write output
-  const json = {
-    patch: "live",
-    generated_at: new Date().toISOString(),
-    sample: seen.size,
-    comps: [] as any[]
-  };
-
-  fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
-  fs.writeFileSync(OUT_FILE, JSON.stringify(json, null, 2));
-  console.log(`Wrote ${OUT_FILE} with sample=${json.sample}`);
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-main().catch(err => {
-  console.error("FATAL", err);
+async function main() {
+  const config = { PLATFORM, REGION, MIN_SAMPLE, SEED_PLAYERS, COUNT_PER };
+  console.log("config:", JSON.stringify(config));
+
+  // 1) Get a good pool of Diamond seeds (paged)
+  const rawSeeds = await listDiamondSeeds(PLATFORM, { perPage: 50, pageFrom: 1, pageTo: 3 });
+  console.log("Diamond+ seeds fetched:", rawSeeds.length);
+
+  // Dedup by summonerId and limit to SEED_PLAYERS
+  const seenIds = new Set<string>();
+  const seeds = rawSeeds.filter(s => {
+    if (!s.summonerId) return false;
+    if (seenIds.has(s.summonerId)) return false;
+    seenIds.add(s.summonerId);
+    return true;
+  }).slice(0, SEED_PLAYERS);
+  console.log("[seed] collected", seeds.length, `(requested ${SEED_PLAYERS})`);
+
+  // 2) Convert seeds to PUUIDs using TFT summoner API (platform route)
+  const puuids: string[] = [];
+  for (const seed of seeds) {
+    let puuid: string | null = null;
+    try {
+      puuid = await puuidFromSummonerId(PLATFORM, seed.summonerId);
+    } catch (e: any) {
+      console.warn(`[puuid] by-id FAIL ${e.status ?? ""} for ${seed.summonerId} (${seed.summonerName})`);
+      // fallback to by-name
+      try {
+        puuid = await puuidFromName(PLATFORM, seed.summonerName);
+        console.log(`[puuid] by-name OK for ${seed.summonerName}`);
+      } catch (e2: any) {
+        console.warn(`[puuid] by-name FAIL ${e2.status ?? ""} for ${seed.summonerName}`);
+      }
+    }
+    if (puuid) puuids.push(puuid);
+    // small delay to be polite to rate limits
+    await sleep(60);
+  }
+  console.log("PUUIDs collected:", puuids.length);
+
+  // 3) Pull a few matches per PUUID (region route)
+  const matchIds = new Set<string>();
+  for (const p of puuids) {
+    try {
+      const ids = await matchIdsByPuuid(REGION, p, COUNT_PER);
+      ids.forEach(id => matchIds.add(id));
+      await sleep(60);
+    } catch (e: any) {
+      console.warn(`[matches] FAIL ${e.status ?? ""} for ${p}`);
+    }
+  }
+
+  // Optionally fetch full matches (kept minimal to stay within limits)
+  // const matches: any[] = [];
+  // for (const id of matchIds) {
+  //   try {
+  //     matches.push(await fetchMatch(REGION, id));
+  //     await sleep(60);
+  //   } catch (e: any) {
+  //     console.warn(`[match] FAIL ${e.status ?? ""} for ${id}`);
+  //   }
+  // }
+
+  // 4) Write JSON (you can extend with real comp aggregation later)
+  const out = {
+    patch: "live",
+    generated_at: new Date().toISOString(),
+    sample: matchIds.size,  // number of unique match IDs collected
+    comps: [] as any[],     // TODO: turn matches into comps when ready
+  };
+
+  await fs.mkdir(path.dirname(OUTPUT), { recursive: true });
+  await fs.writeFile(OUTPUT, JSON.stringify(out, null, 2));
+  console.log(`Wrote ${OUTPUT} with sample=${out.sample}`);
+}
+
+main().catch((e) => {
+  console.error("FATAL", e);
   process.exit(1);
 });
