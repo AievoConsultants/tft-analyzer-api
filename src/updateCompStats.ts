@@ -1,106 +1,152 @@
 // src/updateCompStats.ts
-import fs from "node:fs/promises";
-import path from "node:path";
+//
+// Pull seeds (Challenger/GM/Master + Diamond pages), get PUUIDs,
+// fetch match IDs & matches, compute a simple Top 30 comp table by wins,
+// write public/data/comps.json
+
 import {
-  listDiamondSeeds,
-  puuidFromSummonerId,
-  puuidFromName,
-  matchIdsByPuuid,
-  fetchMatch,
   Platform,
   Region,
+  platformToRegion,
+  listDiamondPlusSeeds,
+  puuidFromSummonerId,
+  matchIdsByPuuid,
+  fetchMatch,
 } from "./riot";
+import type { TftMatch, TftParticipant } from "./types";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
-const PLATFORM = (process.env.PLATFORM || "na1") as Platform;
-const REGION = (process.env.REGION || "americas") as Region;
+// ----------------- Config -----------------
+const PLATFORM = (process.env.PLATFORM as Platform) || "na1";
+const REGION: Region = (process.env.REGION as Region) || platformToRegion(PLATFORM);
 
-// knobs for rate/volume – safe defaults
-const MIN_SAMPLE = Number(process.env.MIN_SAMPLE || 5);   // stop after >= this many matches
-const SEED_PLAYERS = Number(process.env.SEED_PLAYERS || 20);
-const COUNT_PER = Number(process.env.COUNT_PER || 3);     // matches per PUUID
-const OUTPUT = path.join(process.cwd(), "public", "data", "comps.json");
+// How many matches minimum to aggregate before writing
+const MIN_SAMPLE = Number(process.env.MIN_SAMPLE ?? 50);
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+// How many seed players to pull PUUIDs from
+const SEED_PLAYERS = Number(process.env.SEED_PLAYERS ?? 30);
+
+// For each PUUID, how many match IDs to fetch
+const COUNT_PER = Number(process.env.COUNT_PER ?? 5);
+
+// Which queues to include (1100 = Ranked Standard, 1110 = Hyper Roll, 1160 = Double Up)
+const QUEUES = JSON.parse(process.env.QUEUES ?? "[1100]") as number[];
+
+const OUTPUT = "public/data/comps.json";
+
+// ----------------- Helpers -----------------
+
+function compKeyFromParticipant(p: TftParticipant): string {
+  // "composition" -> sorted list of unit character_id (without star/ items). You can refine later.
+  const ids = (p.units || []).map(u => u.character_id).filter(Boolean);
+  ids.sort();
+  return ids.join("|");
 }
 
+type CompStats = {
+  key: string;
+  wins: number;
+  games: number;
+  sumPlacement: number;
+};
+
+function makeEmptyStats(key: string): CompStats {
+  return { key, wins: 0, games: 0, sumPlacement: 0 };
+}
+
+// ----------------- Main -----------------
+
 async function main() {
-  const config = { PLATFORM, REGION, MIN_SAMPLE, SEED_PLAYERS, COUNT_PER };
-  console.log("config:", JSON.stringify(config));
+  console.log("config:", JSON.stringify({ PLATFORM, REGION, MIN_SAMPLE, SEED_PLAYERS, COUNT_PER, QUEUES }));
 
-  // 1) Get a good pool of Diamond seeds (paged)
-  const rawSeeds = await listDiamondSeeds(PLATFORM, { perPage: 50, pageFrom: 1, pageTo: 3 });
-  console.log("Diamond+ seeds fetched:", rawSeeds.length);
+  // 1) Get seed summoners (IDs + names)
+  const rawSeeds = await listDiamondPlusSeeds(PLATFORM, {
+    target: SEED_PLAYERS * 3,   // try to over-sample to be safe
+    diamondPages: 12,
+  });
 
-  // Dedup by summonerId and limit to SEED_PLAYERS
-  const seenIds = new Set<string>();
-  const seeds = rawSeeds.filter(s => {
-    if (!s.summonerId) return false;
-    if (seenIds.has(s.summonerId)) return false;
-    seenIds.add(s.summonerId);
-    return true;
-  }).slice(0, SEED_PLAYERS);
-  console.log("[seed] collected", seeds.length, `(requested ${SEED_PLAYERS})`);
+  if (!rawSeeds?.length) {
+    console.warn("No seeds returned from Diamond+/league endpoints. Writing empty JSON.");
+    await writeCompsJson({ patch: "live", generated_at: new Date().toISOString(), sample: 0, comps: [] });
+    return;
+  }
 
-  // 2) Convert seeds to PUUIDs using TFT summoner API (platform route)
+  // 2) SummonerId -> PUUID
+  const seedSlice = rawSeeds.slice(0, SEED_PLAYERS);
+  console.log(`[seed] collected ${seedSlice.length} (requested ${SEED_PLAYERS})`);
+
   const puuids: string[] = [];
-  for (const seed of seeds) {
-    let puuid: string | null = null;
-    try {
-      puuid = await puuidFromSummonerId(PLATFORM, seed.summonerId);
-    } catch (e: any) {
-      console.warn(`[puuid] by-id FAIL ${e.status ?? ""} for ${seed.summonerId} (${seed.summonerName})`);
-      // fallback to by-name
-      try {
-        puuid = await puuidFromName(PLATFORM, seed.summonerName);
-        console.log(`[puuid] by-name OK for ${seed.summonerName}`);
-      } catch (e2: any) {
-        console.warn(`[puuid] by-name FAIL ${e2.status ?? ""} for ${seed.summonerName}`);
-      }
-    }
+  for (const s of seedSlice) {
+    const puuid = await puuidFromSummonerId(PLATFORM, s.summonerId);
     if (puuid) puuids.push(puuid);
-    // small delay to be polite to rate limits
-    await sleep(60);
   }
-  console.log("PUUIDs collected:", puuids.length);
+  console.log(`PUUIDs collected: ${puuids.length}`);
 
-  // 3) Pull a few matches per PUUID (region route)
-  const matchIds = new Set<string>();
-  for (const p of puuids) {
-    try {
-      const ids = await matchIdsByPuuid(REGION, p, COUNT_PER);
-      ids.forEach(id => matchIds.add(id));
-      await sleep(60);
-    } catch (e: any) {
-      console.warn(`[matches] FAIL ${e.status ?? ""} for ${p}`);
+  // 3) For each PUUID, fetch match IDs
+  const allMatchIds = new Set<string>();
+  for (const puuid of puuids) {
+    const ids = await matchIdsByPuuid(REGION, puuid, COUNT_PER);
+    ids.forEach(id => allMatchIds.add(id));
+  }
+  console.log(`unique match IDs: ${allMatchIds.size}`);
+
+  // 4) Fetch matches and aggregate
+  let sample = 0;
+  const compMap = new Map<string, CompStats>();
+
+  for (const id of allMatchIds) {
+    const match = (await fetchMatch(REGION, id)) as TftMatch | null;
+    if (!match?.info?.participants) continue;
+
+    const info = match.info;
+    if (!QUEUES.includes(info.queue_id)) continue;
+
+    sample++;
+
+    // winner (placement 1) contributes one win to that comp
+    const winner = info.participants.find(p => p.placement === 1);
+    if (winner) {
+      const key = compKeyFromParticipant(winner);
+      const s = compMap.get(key) ?? makeEmptyStats(key);
+      s.wins += 1;
+      s.games += 1;             // for now we only track the winner's comp
+      s.sumPlacement += winner.placement;
+      compMap.set(key, s);
     }
+
+    if (sample >= MIN_SAMPLE) break;
   }
 
-  // Optionally fetch full matches (kept minimal to stay within limits)
-  // const matches: any[] = [];
-  // for (const id of matchIds) {
-  //   try {
-  //     matches.push(await fetchMatch(REGION, id));
-  //     await sleep(60);
-  //   } catch (e: any) {
-  //     console.warn(`[match] FAIL ${e.status ?? ""} for ${id}`);
-  //   }
-  // }
+  // 5) Build "Top 30" comps
+  const comps = [...compMap.values()]
+    .sort((a, b) => b.wins - a.wins)
+    .slice(0, 30)
+    .map(({ key, wins, games, sumPlacement }) => ({
+      units: key.split("|"),
+      wins,
+      games,
+      avg_place: games > 0 ? +(sumPlacement / games).toFixed(2) : null,
+    }));
 
-  // 4) Write JSON (you can extend with real comp aggregation later)
   const out = {
     patch: "live",
     generated_at: new Date().toISOString(),
-    sample: matchIds.size,  // number of unique match IDs collected
-    comps: [] as any[],     // TODO: turn matches into comps when ready
+    sample,
+    comps,
   };
 
-  await fs.mkdir(path.dirname(OUTPUT), { recursive: true });
-  await fs.writeFile(OUTPUT, JSON.stringify(out, null, 2));
-  console.log(`Wrote ${OUTPUT} with sample=${out.sample}`);
+  await writeCompsJson(out);
+  console.log(`Wrote ${OUTPUT} with sample=${sample}`);
 }
 
-main().catch((e) => {
-  console.error("FATAL", e);
+async function writeCompsJson(data: any) {
+  const dir = dirname(OUTPUT);
+  await mkdir(dir, { recursive: true });
+  await writeFile(OUTPUT, JSON.stringify(data, null, 2), "utf8");
+}
+
+main().catch(err => {
+  console.error(err);
   process.exit(1);
 });
