@@ -1,166 +1,213 @@
 // src/riot.ts
-// Low-level Riot helpers: hosts, fetchJson with retries, seed discovery, PUUID, match fetch.
+// Diamond+ seed collector with tolerant ID extraction.
+// Works for Challenger / Grandmaster / Master / Diamond I-IV.
+// Uses standard Riot endpoints and logs progression for GH Actions visibility.
 
-export type Platform = "na1" | "euw1" | "eun1" | "kr" | "br1" | "oc1" | "jp1" | "la1" | "la2" | "ru" | "tr1";
-export type Region   = "americas" | "europe" | "asia" | "sea";
+type Seed = {
+  summonerId: string;
+  summonerName: string;
+};
 
-export const PLATFORM_BASE: Record<Platform, string> = {
+// Minimal platform/region -> host tables (extend if you need more)
+const PLATFORM_HOST: Record<string, string> = {
   na1: "https://na1.api.riotgames.com",
   euw1: "https://euw1.api.riotgames.com",
   eun1: "https://eun1.api.riotgames.com",
   kr: "https://kr.api.riotgames.com",
-  br1: "https://br1.api.riotgames.com",
-  oc1: "https://oc1.api.riotgames.com",
   jp1: "https://jp1.api.riotgames.com",
+  br1: "https://br1.api.riotgames.com",
   la1: "https://la1.api.riotgames.com",
   la2: "https://la2.api.riotgames.com",
-  ru: "https://ru.api.riotgames.com",
+  oc1: "https://oc1.api.riotgames.com",
   tr1: "https://tr1.api.riotgames.com",
+  ru: "https://ru.api.riotgames.com",
 };
 
-export const REGION_BASE: Record<Region, string> = {
+const REGION_HOST: Record<string, string> = {
   americas: "https://americas.api.riotgames.com",
-  europe:   "https://europe.api.riotgames.com",
-  asia:     "https://asia.api.riotgames.com",
-  sea:      "https://sea.api.riotgames.com",
+  europe: "https://europe.api.riotgames.com",
+  asia: "https://asia.api.riotgames.com",
+  sea: "https://sea.api.riotgames.com",
 };
 
-// Map platform -> region for TFT match endpoints.
-export function platformToRegion(platform: Platform): Region {
-  if (["na1", "br1", "oc1", "la1", "la2"].includes(platform)) return "americas";
-  if (["euw1", "eun1", "tr1", "ru"].includes(platform))      return "europe";
-  if (["kr", "jp1"].includes(platform))                       return "asia";
-  return "americas";
-}
+/** Small polite delay to stay well under rate limits */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export class HttpError extends Error {
-  constructor(public status: number, public body: string, msg?: string) {
-    super(msg ?? `HTTP ${status}: ${body?.slice(0, 200)}`);
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise(res => setTimeout(res, ms));
-}
-
-// Simple conservative throttling + retry (429, 5xx).
-export async function fetchJson(url: string, init?: RequestInit, tries = 5, tag?: string): Promise<any> {
-  const key = process.env.RIOT_API_KEY;
-  const headers: any = { ...(init?.headers ?? {}), "X-Riot-Token": key! };
-
-  // 150ms per call ~ 6.6 rps << 20 rps, also below 100/120s when averaged with retries.
-  await sleep(150);
-
-  const res = await fetch(url, { ...init, headers });
+async function riotGET<T>(host: string, path: string, apiKey: string): Promise<T> {
+  const url = `${host}${path}`;
+  const res = await fetch(url, {
+    headers: {
+      "X-Riot-Token": apiKey,
+      "Accept": "application/json",
+    },
+  });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    const status = res.status;
-
-    // 429 / 5xx retry with backoff
-    if ((status === 429 || (status >= 500 && status < 600)) && tries > 0) {
-      const retryAfter = Number(res.headers.get("retry-after") || 1);
-      const wait = Math.max(1500, retryAfter * 1000);
-      console.warn(`[fetchJson] ${tag || url} -> ${status}. Retrying in ${wait}ms (tries=${tries - 1})`);
-      await sleep(wait);
-      return fetchJson(url, init, tries - 1, tag || url);
-    }
-
-    throw new HttpError(status, body, `[fetchJson] ${tag || url} failed: ${status}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`GET ${path} -> ${res.status} ${res.statusText} ${text ? `: ${text.slice(0, 200)}` : ""}`);
   }
+  return (await res.json()) as T;
+}
 
+/** Tolerant extractors so we don't miss IDs due to small schema shifts */
+function extractId(e: any): string | null {
+  return (
+    e?.summonerId ??              // common on entries
+    e?.encryptedSummonerId ??     // older naming
+    e?.summonerID ??              // variations seen in some envs
+    e?.id ??                      // some league payloads
+    null
+  );
+}
+function extractName(e: any): string {
+  return (
+    e?.summonerName ??
+    e?.playerOrTeamName ??
+    e?.gameName ??
+    "unknown"
+  );
+}
+
+/**
+ * Pull seeds from Challenger / Grandmaster / Master league endpoints.
+ */
+async function pushTopLeagues(platform: string, apiKey: string, seeds: Seed[], seen: Set<string>) {
+  const host = PLATFORM_HOST[platform];
+  if (!host) throw new Error(`Unsupported platform: ${platform}`);
+
+  const kinds = ["challenger", "grandmaster", "master"] as const;
+  for (const kind of kinds) {
+    try {
+      const path = `/tft/league/v1/${kind}`;
+      const json = await riotGET<any>(host, path, apiKey);
+
+      // entries array is usually at json.entries
+      const entries = Array.isArray(json?.entries) ? json.entries : [];
+      const sampleKeys = entries.length ? Object.keys(entries[0]).slice(0, 10).join(",") : "";
+      console.log(`[seed] ${kind} entries=${entries.length}${sampleKeys ? ` sample keys: ${sampleKeys}` : ""}`);
+
+      let added = 0, skipped = 0;
+      for (const e of entries) {
+        const id = extractId(e);
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          seeds.push({ summonerId: id, summonerName: extractName(e) });
+          added++;
+        } else {
+          skipped++;
+        }
+      }
+      console.log(`[seed] ${kind}: added=${added}, skipped=${skipped}`);
+    } catch (err: any) {
+      console.log(`[seed] ${kind} fetch failed: ${err?.message || err}`);
+    }
+    await sleep(120); // small pause between heavy endpoints
+  }
+}
+
+/**
+ * Pull seeds from DIAMOND I–IV using paginated entries endpoint.
+ * We walk pages until an empty page is hit or maxPages is reached.
+ */
+async function pushDiamond(platform: string, apiKey: string, seeds: Seed[], seen: Set<string>) {
+  const host = PLATFORM_HOST[platform];
+  const divisions = ["I", "II", "III", "IV"];
+  const maxPages = 12; // Riot returns ~205 per page; 10-12 pages covers most snapshots
+
+  for (const div of divisions) {
+    for (let page = 1; page <= maxPages; page++) {
+      try {
+        const path = `/tft/league/v1/entries/DIAMOND/${div}?page=${page}`;
+        const arr = await riotGET<any[]>(host, path, apiKey);
+
+        const entries = Array.isArray(arr) ? arr : [];
+        console.log(`[seed] diamond ${div} page=${page} entries=${entries.length}`);
+
+        if (!entries.length) break; // no more pages for this division
+
+        let added = 0, skipped = 0;
+        // Log one sample per division for debugging
+        if (page === 1 && entries.length) {
+          const sampleKeys = Object.keys(entries[0]).slice(0, 10).join(",");
+          console.log(`[seed] diamond ${div} sample keys: ${sampleKeys}`);
+        }
+        for (const e of entries) {
+          const id = extractId(e);
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            seeds.push({ summonerId: id, summonerName: extractName(e) });
+            added++;
+          } else {
+            skipped++;
+          }
+        }
+        console.log(`[seed] diamond ${div} page=${page} added=${added}, skipped=${skipped}`);
+      } catch (err: any) {
+        console.log(`[seed] diamond ${div} page=${page} failed: ${err?.message || err}`);
+      }
+      await sleep(80); // polite delay between pages
+    }
+  }
+}
+
+/**
+ * Public function your updateCompStats.ts should call.
+ * It aggregates Challenger + GM + Master + Diamond I–IV.
+ */
+export async function listDiamondPlusSeeds(platform: string): Promise<Seed[]> {
+  const apiKey = process.env.RIOT_API_KEY || "";
+  if (!apiKey) throw new Error("RIOT_API_KEY is not set");
+
+  const seeds: Seed[] = [];
+  const seen = new Set<string>();
+
+  console.log(`[seed] collecting Diamond+ seeds for platform=${platform}`);
+  await pushTopLeagues(platform, apiKey, seeds, seen);
+  await pushDiamond(platform, apiKey, seeds, seen);
+
+  console.log(`[seed] total unique seeds=${seen.size}`);
+  return seeds;
+}
+
+/**
+ * Optional helpers you may already be using in updateCompStats.ts
+ * (Included here so you can use a single import from './riot'.)
+ */
+
+export async function getPUUIDBySummonerId(platform: string, summonerId: string): Promise<string | null> {
+  const host = PLATFORM_HOST[platform];
+  const apiKey = process.env.RIOT_API_KEY || "";
+  if (!host || !apiKey) return null;
   try {
-    return await res.json();
+    const p = `/tft/summoner/v1/summoners/${encodeURIComponent(summonerId)}`;
+    const s = await riotGET<any>(host, p, apiKey);
+    return s?.puuid || null;
   } catch {
     return null;
   }
 }
 
-/** Collect Challenger/GM/Master + Diamond seeds. */
-export async function listDiamondPlusSeeds(
-  platform: Platform,
-  opts: { target?: number; diamondPages?: number } = {},
-): Promise<Array<{ summonerId: string; summonerName: string }>> {
-  const { target = 300, diamondPages = 10 } = opts;
-  const base = PLATFORM_BASE[platform];
-
-  const seeds: Array<{ summonerId: string; summonerName: string }> = [];
-  const seen = new Set<string>();
-
-  async function push(entries: any[] | undefined, label: string) {
-    const arr = Array.isArray(entries) ? entries : [];
-    console.log(`[seed] ${label} entries=${arr.length}`);
-    for (const e of arr) {
-      const id = e?.summonerId;
-      const name = e?.summonerName;
-      if (id && name && !seen.has(id)) {
-        seen.add(id);
-        seeds.push({ summonerId: id, summonerName: name });
-      }
-    }
-  }
-
-  // Challenger / GM / Master lists
-  for (const tier of ["challenger", "grandmaster", "master"] as const) {
-    const url = `${base}/tft/league/v1/${tier}`;
-    try {
-      const data: any = await fetchJson(url, undefined, 5, tier);
-      await push(data?.entries, tier);
-    } catch (e: any) {
-      console.warn(`[seed] ${tier} FAIL ${e.status ?? ""} ${e.message ?? e}`);
-    }
-  }
-
-  // Diamond across divisions & pages
-  const divisions = ["I", "II", "III", "IV"];
-  for (const div of divisions) {
-    for (let page = 1; page <= diamondPages && seeds.length < target; page++) {
-      const url = `${base}/tft/league/v1/entries/DIAMOND/${div}?page=${page}`;
-      try {
-        const entries: any[] = await fetchJson(url, undefined, 5, `diamond ${div} p${page}`);
-        await push(entries, `diamond ${div} page=${page}`);
-      } catch (e: any) {
-        console.warn(`[seed] diamond ${div} page=${page} FAIL ${e.status ?? ""} ${e.message ?? e}`);
-      }
-    }
-  }
-
-  console.log(`[seed] total unique seeds=${seeds.length}`);
-  return seeds.slice(0, target);
-}
-
-export async function puuidFromSummonerId(platform: Platform, summonerId: string): Promise<string | null> {
-  const base = PLATFORM_BASE[platform];
-  const url = `${base}/tft/summoner/v1/summoners/${encodeURIComponent(summonerId)}`;
+export async function matchIdsByPUUID(region: string, puuid: string, count: number): Promise<string[]> {
+  const host = REGION_HOST[region];
+  const apiKey = process.env.RIOT_API_KEY || "";
+  if (!host || !apiKey) return [];
   try {
-    const data = await fetchJson(url, undefined, 5, "summonerById");
-    return data?.puuid ?? null;
-  } catch (e: any) {
-    if (e.status === 404) return null;
-    console.warn(`[puuidFromSummonerId] ${summonerId} -> ${e.status ?? ""} ${e.message ?? e}`);
-    return null;
-  }
-}
-
-export async function matchIdsByPuuid(region: Region, puuid: string, count = 5): Promise<string[]> {
-  const base = REGION_BASE[region];
-  const url = `${base}/tft/match/v1/matches/by-puuid/${encodeURIComponent(puuid)}/ids?start=0&count=${count}`;
-  try {
-    const data: string[] = await fetchJson(url, undefined, 5, "matchIdsByPuuid");
-    return Array.isArray(data) ? data : [];
-  } catch (e: any) {
-    console.warn(`[matchIdsByPuuid] ${puuid} -> ${e.status ?? ""} ${e.message ?? e}`);
+    const p = `/tft/match/v1/matches/by-puuid/${encodeURIComponent(puuid)}/ids?count=${count}`;
+    const ids = await riotGET<any[]>(host, p, apiKey);
+    return Array.isArray(ids) ? ids : [];
+  } catch {
     return [];
   }
 }
 
-export async function fetchMatch(region: Region, matchId: string): Promise<any | null> {
-  const base = REGION_BASE[region];
-  const url = `${base}/tft/match/v1/matches/${encodeURIComponent(matchId)}`;
+export async function fetchMatch(region: string, matchId: string): Promise<any | null> {
+  const host = REGION_HOST[region];
+  const apiKey = process.env.RIOT_API_KEY || "";
+  if (!host || !apiKey) return null;
   try {
-    return await fetchJson(url, undefined, 5, `match ${matchId}`);
-  } catch (e: any) {
-    console.warn(`[fetchMatch] ${matchId} -> ${e.status ?? ""} ${e.message ?? e}`);
+    const p = `/tft/match/v1/matches/${encodeURIComponent(matchId)}`;
+    return await riotGET<any>(host, p, apiKey);
+  } catch {
     return null;
   }
 }
