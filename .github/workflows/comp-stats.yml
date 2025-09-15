@@ -26,17 +26,16 @@ jobs:
         with: { node-version: 20 }
 
       - name: Generate comps.json
+        env:
+          RIOT_API_KEY: ${{ inputs.RIOT_API_KEY }}
+          PLATFORM: na1
+          REGION: americas
+          MIN_SAMPLE: "10"
+          SEED_PLAYERS: "20"
+          COUNT_PER: "3"
+          RATE_DELAY_MS: "1300"
+          QUEUES: "1100"
         run: node scripts/update_comp_stats.mjs
-       env:
-  RIOT_API_KEY: ${{ inputs.RIOT_API_KEY }}
-  PLATFORM: na1          # or euw1/kr/etc
-  REGION: americas       # europe / asia / sea
-  MIN_SAMPLE: "10"       # start low so we definitely get output
-  SEED_PLAYERS: "20"
-  COUNT_PER: "3"
-  RATE_DELAY_MS: "1300"  # 1.3s per host ≈ 92 req / 2min (under limits)
-  QUEUES: "1100"         # Standard only; can add 1160 for Hyper Roll
-
 
       - name: Commit & push JSON
         run: |
@@ -44,8 +43,9 @@ jobs:
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add public/data/comps.json
-            git commit -m "chore: refresh comps.json" || echo "no changes"
+            git diff --cached --quiet || git commit -m "chore: refresh comps.json"
             git push
           else
-            echo "comps.json not produced (no data or rate limit)."; exit 1
+            echo "comps.json not produced; keeping previous file"
+            exit 1
           fi
