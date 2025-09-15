@@ -1,0 +1,30 @@
+name: Build TFT Top-30 Comps
+on:
+  workflow_dispatch:
+    inputs:
+      RIOT_API_KEY:
+        description: "Paste your 24h Riot dev key"
+        required: true
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Generate comps.json
+        run: node scripts/update_comp_stats.mjs
+        env:
+          RIOT_API_KEY: ${{ inputs.RIOT_API_KEY }}
+          PLATFORM: na1        # change to euw1/kr/etc if needed
+          REGION: americas     # europe / asia / sea
+          MIN_SAMPLE: "120"    # lower while testing; raise later (e.g., 150–300)
+      - name: Commit & push JSON
+        run: |
+          git config user.name "stats-bot"
+          git config user.email "bot@example.com"
+          git add public/data/comps.json
+          git commit -m "chore: refresh comps.json" || echo "no changes"
+          git push
