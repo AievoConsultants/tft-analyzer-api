@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
-import { RiotClient } from "./riot.js";
-import { boardKey, CompsJson } from "./types.js";
+import { RiotClient } from "./riot.";
+import { boardKey, CompsJson } from "./types.";
 import pLimit from "p-limit";
 
 const ENV = (name: string, def?: string) => process.env[name] ?? def ?? "";
