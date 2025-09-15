@@ -1,66 +1,89 @@
 // src/riot.ts
-// Minimal Riot API helpers used by updateCompStats.ts
 
-const RIOT_API_KEY = process.env.RIOT_API_KEY!;
-if (!RIOT_API_KEY) {
-  throw new Error("RIOT_API_KEY env var is required");
+export interface RiotOptions {
+  apiKey?: string;
+  region?: 'americas' | 'europe' | 'asia' | 'sea';
+  platform?: string; // e.g., na1, euw1, kr
 }
 
-// Defaults can be overridden in the workflow env
-const PLATFORM = (process.env.PLATFORM ?? "na1").toLowerCase();     // e.g., na1, euw1, kr
-const REGION   = (process.env.REGION ?? "americas").toLowerCase();  // americas | europe | asia | sea
+export class RiotClient {
+  private apiKey: string;
+  private region: string;
+  private platform: string;
 
-// Simple fetch with basic 429 handling (uses Node 20 global fetch)
-async function riot<T>(url: string): Promise<T> {
-  const res = await fetch(url, {
-    headers: {
-      "X-Riot-Token": RIOT_API_KEY,
-    },
-  });
+  constructor(opts: RiotOptions = {}) {
+    this.apiKey = opts.apiKey ?? process.env.RIOT_API_KEY ?? '';
+    this.region = (opts.region ?? (process.env.REGION ?? 'americas')).toLowerCase();
+    this.platform = (opts.platform ?? (process.env.PLATFORM ?? 'na1')).toLowerCase();
 
-  // Basic 429 retry support
-  if (res.status === 429) {
-    const retryAfter = Number(res.headers.get("Retry-After") ?? 1);
-    await new Promise((r) => setTimeout(r, (retryAfter + 0.5) * 1000));
-    return riot<T>(url);
+    if (!this.apiKey) {
+      throw new Error('RIOT_API_KEY env var is required');
+    }
   }
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Riot API error ${res.status} ${res.statusText} for ${url}\n${text}`);
+  /** Low-level request with basic 429 retry */
+  private async request<T>(url: string): Promise<T> {
+    const res = await fetch(url, {
+      headers: {
+        'X-Riot-Token': this.apiKey,
+      },
+    });
+
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get('Retry-After') ?? 1);
+      await new Promise((r) => setTimeout(r, (retryAfter + 0.5) * 1000));
+      return this.request<T>(url);
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Riot API error ${res.status} ${res.statusText} for ${url}\n${text}`);
+    }
+    return res.json() as Promise<T>;
   }
-  return res.json() as Promise<T>;
-}
 
-/** Data Dragon latest version (e.g., "15.18.1") */
-export async function getDDVersion(): Promise<string> {
-  const versions = await riot<string[]>("https://ddragon.leagueoflegends.com/api/versions.json");
-  if (!versions.length) throw new Error("No DD versions returned");
-  return versions[0];
-}
-
-/** Get match ids for a puuid from Match-V5 */
-export async function getMatchIds(puuid: string, count = 20, queue?: number): Promise<string[]> {
-  const qs = new URLSearchParams({
-    count: String(count),
-  });
-  if (queue) qs.set("queue", String(queue));
-
-  const url = `https://${REGION}.api.riotgames.com/lol/match/v5/matches/by-puuid/${puuid}/ids?${qs.toString()}`;
-  return riot<string[]>(url);
-}
-
-/** Get a single match payload */
-export async function getMatch(matchId: string): Promise<any> {
-  const url = `https://${REGION}.api.riotgames.com/lol/match/v5/matches/${matchId}`;
-  return riot<any>(url);
-}
-
-/** Convenience: fetch many matches (sequential to be gentle; you can parallelize with your rateLimiter) */
-export async function getMatches(matchIds: string[]): Promise<any[]> {
-  const out: any[] = [];
-  for (const id of matchIds) {
-    out.push(await getMatch(id));
+  /** Data Dragon latest version (e.g., "15.18.1") */
+  async getDDVersion(): Promise<string> {
+    const versions = await this.request<string[]>(
+      'https://ddragon.leagueoflegends.com/api/versions.json'
+    );
+    if (!versions.length) throw new Error('No DD versions returned');
+    return versions[0];
   }
-  return out;
+
+  /** Match-V5: match ids for a puuid */
+  async getMatchIds(puuid: string, count = 20, queue?: number): Promise<string[]> {
+    const qs = new URLSearchParams({ count: String(count) });
+    if (queue) qs.set('queue', String(queue));
+
+    const url = `https://${this.region}.api.riotgames.com/lol/match/v5/matches/by-puuid/${puuid}/ids?${qs.toString()}`;
+    return this.request<string[]>(url);
+  }
+
+  /** Match-V5: a single match payload */
+  async getMatch(matchId: string): Promise<any> {
+    const url = `https://${this.region}.api.riotgames.com/lol/match/v5/matches/${matchId}`;
+    return this.request<any>(url);
+  }
+
+  /** Convenience: get many matches sequentially (you can parallelize with your rate limiter) */
+  async getMatches(matchIds: string[]): Promise<any[]> {
+    const out: any[] = [];
+    for (const id of matchIds) {
+      out.push(await this.getMatch(id));
+    }
+    return out;
+  }
 }
+
+/** Factory if you prefer */
+export function createRiotClient(opts?: RiotOptions) {
+  return new RiotClient(opts);
+}
+
+/** Function-style exports (optional, for places that import helpers directly) */
+const defaultClient = new RiotClient();
+export const getDDVersion = () => defaultClient.getDDVersion();
+export const getMatchIds = (puuid: string, count?: number, queue?: number) =>
+  defaultClient.getMatchIds(puuid, count, queue);
+export const getMatches = (ids: string[]) => defaultClient.getMatches(ids);
