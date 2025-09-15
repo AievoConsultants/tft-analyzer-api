@@ -212,16 +212,17 @@ function aggregate(matches, champByApi, itemById) {
   };
 
   await fs.mkdir("public/data", { recursive: true });
-  const tmp = "public/data/comps.tmp.json";
-  await fs.writeFile(tmp, JSON.stringify(out, null, 2), "utf8");
+const tmp = "public/data/comps.tmp.json";
+await fs.writeFile(tmp, JSON.stringify(out, null, 2), "utf8");
 
-  if (comps.length > 0) {
-    await fs.rename(tmp, "public/data/comps.json");
-    console.log("Wrote public/data/comps.json with", comps.length, "comps");
-  } else {
-    console.warn("No comps met MIN_SAMPLE; keeping previous comps.json if any.");
-    try { await fs.unlink(tmp); } catch {}
-  }
+if (comps.length > 0) {
+  await fs.rename(tmp, "public/data/comps.json");
+  console.log("Wrote public/data/comps.json with", comps.length, "comps");
+} else {
+  console.warn("No comps met MIN_SAMPLE; keeping previous comps.json if any.");
+  try { await fs.unlink(tmp); } catch {}
+}
+
 })().catch((e) => {
   console.error("update_comp_stats failed:", e);
   process.exit(1);
