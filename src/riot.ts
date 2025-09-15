@@ -1,97 +1,88 @@
 // src/riot.ts
 
-export type Platform =
-  | 'na1' | 'br1' | 'la1' | 'la2'
-  | 'euw1' | 'eun1' | 'tr1' | 'ru'
-  | 'kr' | 'jp1' | 'oc1';
+type Division = "I" | "II" | "III" | "IV";
+type Tier = "CHALLENGER" | "GRANDMASTER" | "MASTER" | "DIAMOND";
 
-export type Region = 'americas' | 'europe' | 'asia' | 'sea';
-
-const QUEUE = 'RANKED_TFT';
-
-export interface LeagueEntry {
-  summonerId: string;
-  summonerName: string;
-  leaguePoints: number;
-  rank?: string;
-  tier?: string;
+// Generic GET with API key
+async function getJson<T>(url: string, apiKey: string): Promise<T> {
+  const res = await fetch(url, { headers: { "X-Riot-Token": apiKey } });
+  if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
+  return res.json() as Promise<T>;
 }
 
-export interface SummonerDTO { puuid: string; id: string; }
+// Optional small delay to be gentle with limits (tweak if needed)
+export const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
-
-export async function riot<T>(url: string, key: string, tries = 3): Promise<T> {
-  for (let i = 0; i < tries; i++) {
-    const res = await fetch(url, { headers: { 'X-Riot-Token': key } });
-    if (res.status === 429) { await sleep(1200); continue; }
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${url}`);
-    return res.json() as Promise<T>;
-  }
-  throw new Error(`Rate limited too many times for ${url}`);
-}
-
-export function platformToRegion(p: Platform): Region {
-  if (['na1', 'br1', 'la1', 'la2', 'oc1'].includes(p)) return 'americas';
-  if (['euw1', 'eun1', 'tr1', 'ru'].includes(p)) return 'europe';
-  if (['kr', 'jp1'].includes(p)) return 'asia';
-  return 'sea';
-}
-
-export async function topTierIds(platform: Platform, key: string): Promise<string[]> {
+/** Use TFT *league* endpoints to get Diamond+ encryptedSummonerIds */
+export async function fetchDiamondPlusSummonerIds(
+  platform: string,      // e.g. "na1"
+  apiKey: string,
+  maxSeeds: number       // stop when we have enough
+): Promise<string[]> {
   const base = `https://${platform}.api.riotgames.com/tft/league/v1`;
-  const master = await riot<{ entries: LeagueEntry[] }>(`${base}/master?queue=${QUEUE}`, key).catch(() => ({ entries: [] as LeagueEntry[] }));
-  const gm     = await riot<{ entries: LeagueEntry[] }>(`${base}/grandmaster?queue=${QUEUE}`, key).catch(() => ({ entries: [] as LeagueEntry[] }));
-  const ch     = await riot<{ entries: LeagueEntry[] }>(`${base}/challenger?queue=${QUEUE}`, key).catch(() => ({ entries: [] as LeagueEntry[] }));
-  const all = [...(master.entries || []), ...(gm.entries || []), ...(ch.entries || [])];
-  return Array.from(new Set(all.map(e => e.summonerId)));
-}
+  const out: string[] = [];
 
-export async function diamondPlusIds(platform: Platform, key: string, pages = 1): Promise<string[]> {
-  // DIAMOND I..IV pages + Master/GM/Challenger
-  const base = `https://${platform}.api.riotgames.com/tft/league/v1/entries`;
-  const divisions = ['I', 'II', 'III', 'IV'];
-  const ids: string[] = [];
+  // Master+ (no paging)
+  for (const path of ["challenger", "grandmaster", "master"]) {
+    try {
+      const data = await getJson<{ entries: { summonerId: string }[] }>(`${base}/${path}`, apiKey);
+      for (const e of data.entries) {
+        out.push(e.summonerId);
+        if (out.length >= maxSeeds) return Array.from(new Set(out));
+      }
+    } catch { /* skip transient failures */ }
+    await sleep(200);
+  }
 
-  for (const d of divisions) {
-    for (let page = 1; page <= pages; page++) {
-      const url = `${base}/DIAMOND/${d}?queue=${QUEUE}&page=${page}`;
-      const entries = await riot<LeagueEntry[]>(url, key).catch(() => []);
-      for (const e of entries) ids.push(e.summonerId);
-      await sleep(120); // light throttle
+  // Diamond (paged by division)
+  const divs: Division[] = ["I", "II", "III", "IV"];
+  for (const div of divs) {
+    let page = 1;
+    while (out.length < maxSeeds) {
+      try {
+        const url = `${base}/entries/DIAMOND/${div}?page=${page}`;
+        const entries = await getJson<{ summonerId: string }[]>(url, apiKey);
+        if (!entries.length) break;
+        for (const e of entries) {
+          out.push(e.summonerId);
+          if (out.length >= maxSeeds) return Array.from(new Set(out));
+        }
+      } catch {
+        break; // move on if division/page unavailable
+      }
+      page++;
+      await sleep(150);
     }
   }
 
-  const top = await topTierIds(platform, key);
-  return Array.from(new Set([...ids, ...top]));
+  return Array.from(new Set(out));
 }
 
-export async function toPuuid(platform: Platform, key: string, encryptedSummonerId: string): Promise<string> {
-  const dto = await riot<SummonerDTO>(
-    `https://${platform}.api.riotgames.com/tft/summoner/v1/summoners/${encryptedSummonerId}`,
-    key
-  );
-  return dto.puuid;
+/** Use *TFT* Summoner API (not LoL!) to turn encryptedSummonerId -> PUUID */
+export async function getPuuidBySummonerId(
+  platform: string,            // e.g. "na1"
+  encryptedSummonerId: string,
+  apiKey: string
+): Promise<string | null> {
+  const url = `https://${platform}.api.riotgames.com/tft/summoner/v1/summoners/${encodeURIComponent(encryptedSummonerId)}`;
+  const res = await fetch(url, { headers: { "X-Riot-Token": apiKey } });
+  if (!res.ok) return null;   // 404s happen for stale ids; just skip
+  const data = await res.json();
+  return data?.puuid ?? null;
 }
 
-export async function recentMatchIds(region: Region, key: string, puuid: string, count = 5): Promise<string[]> {
-  const url = `https://${region}.api.riotgames.com/tft/match/v1/matches/by-puuid/${puuid}/ids?start=0&count=${count}`;
-  return riot<string[]>(url, key);
-}
-
-export type MatchDto = {
-  info: {
-    participants: Array<{
-      puuid: string;
-      units: Array<{ character_id: string; items: number[] }>;
-      placement: number;
-    }>;
-    game_datetime: number;
-    queue_id: number;
-  };
-  metadata: { match_id: string };
-};
-
-export async function fetchMatch(region: Region, key: string, matchId: string) {
-  return riot<MatchDto>(`https://${region}.api.riotgames.com/tft/match/v1/matches/${matchId}`, key);
+/** Get match IDs for a PUUID from regional route (americas/europe/asia/sea) */
+export async function fetchMatchIdsByPuuid(
+  region: string,     // e.g. "americas"
+  puuid: string,
+  count: number,      // number of matches to pull per PUUID
+  queue: number,      // e.g. 1100 (ranked)
+  apiKey: string
+): Promise<string[]> {
+  const params = new URLSearchParams({ count: String(count) });
+  if (queue != null) params.set("queue", String(queue));
+  const url = `https://${region}.api.riotgames.com/tft/match/v1/matches/by-puuid/${encodeURIComponent(puuid)}/ids?${params}`;
+  const res = await fetch(url, { headers: { "X-Riot-Token": apiKey } });
+  if (!res.ok) return [];
+  return res.json() as Promise<string[]>;
 }
