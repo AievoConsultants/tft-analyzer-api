@@ -1,0 +1,24 @@
+name: Build TFT Top-30 Comps
+on:
+  schedule: [{ cron: "0 */6 * * *" }]   # every 6 hours (UTC)
+  workflow_dispatch: {}                  # lets you run it manually
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: node scripts/update_comp_stats.mjs
+        env:
+          RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
+          PLATFORM: na1
+          REGION: americas
+          MIN_SAMPLE: "150"
+      - name: Commit & push JSON
+        run: |
+          git config user.name "stats-bot"
+          git config user.email "bot@example.com"
+          git add public/data/comps.json
+          git commit -m "chore: refresh comps.json" || echo "no changes"
+          git push
