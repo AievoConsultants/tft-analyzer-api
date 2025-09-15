@@ -1,0 +1,57 @@
+import { RiotChallengerLeague, RiotMatch, RiotSummoner } from "./types.js";
+import { RateGate } from "./rateLimiter.js";
+
+type GetOpts = { headers?: Record<string, string> };
+
+export class RiotClient {
+  private gate = new RateGate();
+  constructor(
+    private platform: string,     // e.g., na1
+    private region: string,       // e.g., americas
+    private apiKey: string
+  ) {}
+
+  private async get(url: string, opts: GetOpts = {}) {
+    await this.gate.wait();
+
+    const res = await fetch(url, {
+      headers: { "X-Riot-Token": this.apiKey, ...(opts.headers || {}) }
+    });
+
+    if (res.status === 429) {
+      const ra = Math.max(1000, Number(res.headers.get("Retry-After")) * 1000 || 2000);
+      console.warn(`[429] ${url} — sleeping ${ra}ms`);
+      await new Promise(r => setTimeout(r, ra));
+      return this.get(url, opts); // retry once per token
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`HTTP ${res.status} ${res.url} :: ${text.slice(0, 200)}`);
+    }
+    return res.json();
+  }
+
+  async challenger(): Promise<RiotChallengerLeague> {
+    const json = await this.get(`https://${this.platform}.api.riotgames.com/tft/league/v1/challenger`);
+    return RiotChallengerLeague.parse(json);
+  }
+
+  async summoner(summonerId: string): Promise<RiotSummoner> {
+    const json = await this.get(`https://${this.platform}.api.riotgames.com/tft/summoner/v1/summoners/${summonerId}`);
+    return RiotSummoner.parse(json);
+  }
+
+  // IMPORTANT: no queue param here — filter by queue after fetching match details.
+  async matchIds(puuid: string, start = 0, count = 3): Promise<string[]> {
+    const json = await this.get(
+      `https://${this.region}.api.riotgames.com/tft/match/v1/matches/by-puuid/${puuid}/ids?start=${start}&count=${count}`
+    );
+    return Array.isArray(json) ? json as string[] : [];
+  }
+
+  async match(id: string): Promise<RiotMatch> {
+    const json = await this.get(`https://${this.region}.api.riotgames.com/tft/match/v1/matches/${id}`);
+    return RiotMatch.parse(json);
+  }
+}
