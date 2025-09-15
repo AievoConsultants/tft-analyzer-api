@@ -1,17 +1,21 @@
 name: Build TFT Top-30 Comps
 
 on:
-  workflow_dispatch:          # <-- this is what shows the "Run workflow" button
+  workflow_dispatch:
     inputs:
       RIOT_API_KEY:
         description: "Paste your 24h Riot dev key"
         required: true
         type: string
   schedule:
-    - cron: "0 */6 * * *"     # optional auto-refresh every 6 hours
+    - cron: "0 */6 * * *" # optional; every 6 hours
 
 permissions:
-  contents: write             # needed so the action can push comps.json
+  contents: write
+
+concurrency:
+  group: comp-stats
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -19,18 +23,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Use Node 20 with cache
+        uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
 
-      # (Optional) sanity ping so you can see 200/401/403/404/429 quickly
-      - name: Sanity check Riot API key
+      - name: Install deps
+        run: npm ci
+
+      - name: Sanity check Riot API
         env:
           RIOT_API_KEY: ${{ inputs.RIOT_API_KEY }}
           PLATFORM: na1
         run: |
           set -e
-          echo "GET https://${PLATFORM}.api.riotgames.com/tft/league/v1/challenger"
           curl -sS -D - -o /dev/null \
             -H "X-Riot-Token: $RIOT_API_KEY" \
             "https://${PLATFORM}.api.riotgames.com/tft/league/v1/challenger" | sed -n '1,12p'
@@ -43,18 +50,20 @@ jobs:
           MIN_SAMPLE: "5"
           SEED_PLAYERS: "20"
           COUNT_PER: "3"
-          RATE_DELAY_MS: "1300"
           QUEUES: "1100"
-        run: node scripts/update_comp_stats.mjs
+        run: npx tsx src/updateCompStats.ts
+
+      - name: Upload as artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: comps-json
+          path: public/data/comps.json
+          if-no-files-found: error
 
       - name: Commit & push JSON
         run: |
-          if [ -f public/data/comps.json ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add public/data/comps.json
-            git diff --cached --quiet || git commit -m "chore: refresh comps.json"
-            git push
-          else
-            echo "comps.json not produced"; exit 1
-          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/data/comps.json
+          git diff --cached --quiet || git commit -m "chore: refresh comps.json"
+          git push
