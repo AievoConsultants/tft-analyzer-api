@@ -36,15 +36,16 @@ jobs:
             "https://${PLATFORM}.api.riotgames.com/tft/league/v1/challenger" | sed -n '1,12p'
 
       - name: Generate comps.json
-        env:
-          RIOT_API_KEY: ${{ inputs.RIOT_API_KEY }}
-          PLATFORM: na1
-          REGION: americas
-          MIN_SAMPLE: "10"
-          SEED_PLAYERS: "20"
-          COUNT_PER: "3"
-          RATE_DELAY_MS: "1300"
-          QUEUES: "1100"
+  env:
+  RIOT_API_KEY: ${{ inputs.RIOT_API_KEY }}
+  PLATFORM: na1
+  REGION: americas
+  MIN_SAMPLE: "5"
+  SEED_PLAYERS: "20"
+  COUNT_PER: "3"
+  RATE_DELAY_MS: "1300"
+  QUEUES: "1100"       # Standard
+
         run: node scripts/update_comp_stats.mjs
 
       - name: Commit & push JSON
