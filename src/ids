@@ -1,4 +1,4 @@
-import { RiotChallengerLeague, RiotMatch, RiotSummoner } from "./types.js";
+import { RiotChallengerLeague, RiotMatch, RiotSummoner } from "./types";
 import { RateGate } from "./rateLimiter.js";
 
 type GetOpts = { headers?: Record<string, string> };
